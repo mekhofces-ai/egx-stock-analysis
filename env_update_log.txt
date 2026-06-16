@@ -1,0 +1,243 @@
+﻿**********************
+Windows PowerShell transcript start
+Start time: 20260603194502
+Username: DORRA\Omar.Mokhtar
+RunAs User: DORRA\Omar.Mokhtar
+Configuration Name: 
+Machine: CBPFMLP03 (Microsoft Windows NT 10.0.26200.0)
+Host Application: C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+Process ID: 23428
+PSVersion: 5.1.26100.8521
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.8521
+BuildVersion: 10.0.26100.8521
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+Transcript started, output file is C:\Users\omar.mokhtar\Documents\New project\env_update_log.txt
+PS C:\Users\omar.mokhtar\Documents\New project> Write-Host "Updating .env safely..." -ForegroundColor Cyan
+Updating .env safely...
+PS C:\Users\omar.mokhtar\Documents\New project> if (!(Test-Path $EnvPath)) {
+    New-Item -Path $EnvPath -ItemType File | Out-Null
+    Write-Host ".env created" -ForegroundColor Green
+}
+PS C:\Users\omar.mokhtar\Documents\New project> function Get-DotEnvValue {
+    param([string]$Key)
+
+    if (!(Test-Path $EnvPath)) {
+        return $null
+    }
+
+    $line = Get-Content $EnvPath | Where-Object {
+        $_ -match "^\s*$([regex]::Escape($Key))\s*="
+    } | Select-Object -Last 1
+
+    if (!$line) {
+        return $null
+    }
+
+    return ($line -replace "^\s*$([regex]::Escape($Key))\s*=\s*", "").Trim().Trim('"').Trim("'")
+}
+PS C:\Users\omar.mokhtar\Documents\New project> function Set-DotEnvValue {
+    param(
+        [string]$Key,
+        [string]$Value
+    )
+
+    $escapedKey = [regex]::Escape($Key)
+    $newLine = "$Key=$Value"
+
+    $content = @()
+    if (Test-Path $EnvPath) {
+        $content = Get-Content $EnvPath -ErrorAction SilentlyContinue
+    }
+
+    $found = $false
+
+    $newContent = $content | ForEach-Object {
+        if ($_ -match "^\s*$escapedKey\s*=") {
+            $found = $true
+            $newLine
+        } else {
+            $_
+        }
+    }
+
+    if (!$found) {
+        $newContent += $newLine
+    }
+
+    Set-Content -Path $EnvPath -Value $newContent -Encoding UTF8
+}
+PS C:\Users\omar.mokhtar\Documents\New project> function Find-TelegramBotTokenInProject {
+    $excludePattern = "\\(\.git|\.venv|venv|env|__pycache__|node_modules|\.streamlit)\\"
+
+    $files = Get-ChildItem -Path $ProjectPath -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.FullName -notmatch $excludePattern -and
+            $_.Extension -in ".env", ".py", ".txt", ".json", ".toml", ".yaml", ".yml", ".ini", ".cfg"
+        }
+
+    foreach ($file in $files) {
+        try {
+            $matches = Select-String -Path $file.FullName -Pattern "([0-9]{6,}:[A-Za-z0-9_\-]{20,})" -ErrorAction SilentlyContinue
+            foreach ($m in $matches) {
+                if ($m.Matches.Count -gt 0) {
+                    return $m.Matches[0].Groups[1].Value
+                }
+            }
+        } catch {}
+    }
+
+    return $null
+}
+PS C:\Users\omar.mokhtar\Documents\New project> try {
+    $token = Get-DotEnvValue "TELEGRAM_BOT_TOKEN"
+
+    if (!$token) {
+        Write-Host "Searching project files for existing Telegram bot token..." -ForegroundColor Yellow
+        $token = Find-TelegramBotTokenInProject
+    }
+
+    if (!$token) {
+        Write-Host ""
+        Write-Host "Token not found automatically." -ForegroundColor Yellow
+        Write-Host "Paste your TELEGRAM_BOT_TOKEN from BotFather." -ForegroundColor Yellow
+        $token = Read-Host "Enter TELEGRAM_BOT_TOKEN"
+    }
+
+    if (!$token -or $token -notmatch "^[0-9]{6,}:[A-Za-z0-9_\-]{20,}$") {
+        Write-Host "Invalid token format. .env was not updated with token." -ForegroundColor Red
+    } else {
+        Write-Host "Token format looks valid." -ForegroundColor Green
+
+        Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token
+        Set-DotEnvValue "BOT_TOKEN" $token
+    }
+
+    $apiId = Get-DotEnvValue "TELEGRAM_API_ID"
+    if (!$apiId) {
+        $apiId = Read-Host "Enter TELEGRAM_API_ID"
+    }
+
+    $apiHash = Get-DotEnvValue "TELEGRAM_API_HASH"
+    if (!$apiHash) {
+        $apiHash = Read-Host "Enter TELEGRAM_API_HASH"
+    }
+
+    $sessionName = Get-DotEnvValue "TELEGRAM_SESSION_NAME"
+    if (!$sessionName) {
+        $sessionName = "egx_streamlit_session"
+    }
+
+    if ($apiId) {
+        Set-DotEnvValue "TELEGRAM_API_ID" $apiId
+        Set-DotEnvValue "API_ID" $apiId
+    }
+
+    if ($apiHash) {
+        Set-DotEnvValue "TELEGRAM_API_HASH" $apiHash
+        Set-DotEnvValue "API_HASH" $apiHash
+    }
+
+    Set-DotEnvValue "TELEGRAM_SESSION_NAME" $sessionName
+    Set-DotEnvValue "TELEGRAM_SESSION" $sessionName
+    Set-DotEnvValue "SESSION_NAME" $sessionName
+
+    Set-DotEnvValue "DATABASE_URL" "sqlite:///data/app.db"
+    Set-DotEnvValue "SQLITE_TIMEOUT" "30"
+    Set-DotEnvValue "SQLITE_BUSY_TIMEOUT" "30000"
+    Set-DotEnvValue "ENV" "local"
+
+    Write-Host ""
+    Write-Host ".env updated successfully." -ForegroundColor Green
+    Write-Host "Session name: $sessionName" -ForegroundColor Green
+
+    Write-Host ""
+    Write-Host "Current .env keys:" -ForegroundColor Cyan
+    Get-Content $EnvPath | ForEach-Object {
+        if ($_ -match "TOKEN|HASH") {
+            $parts = $_ -split "=", 2
+            if ($parts.Count -eq 2) {
+                Write-Host "$($parts[0])=********"
+            }
+        } else {
+            Write-Host $_
+        }
+    }
+
+} catch {
+    Write-Host ""
+    Write-Host "ERROR happened:" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+Token format looks valid.
+
+.env updated successfully.
+Session name: egx_telegram
+
+Current .env keys:
+DATABASE_URL=sqlite:///data/app.db
+PORT=8788
+NODE_ENV=development
+MARKET_DATA_PROVIDER=egx-ai-api
+LICENSED_API_BASE_URL=""
+LICENSED_API_KEY=""
+LICENSED_API_TIMEOUT_MS=8000
+EGX_AI_API_BASE_URL="http://localhost:8788"
+EGX_AI_API_TIMEOUT_MS=180000
+TWELVE_DATA_API_KEY=""
+TWELVE_DATA_EXCHANGE="EGX"
+CACHE_TTL_MS=300000
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=300
+AUTO_REFRESH_ENABLED=true
+AUTO_REFRESH_ON_START=true
+AUTO_REFRESH_INTERVAL_MS=300000
+ENABLE_MOCK_PROVIDER=false
+ALLOW_INSECURE_MARKET_DATA_TLS=true
+APP_ENV=development
+LOG_LEVEL=INFO
+EGX_DATABASE_URL=sqlite:///./egx_signals.db
+API_HOST=0.0.0.0
+API_PORT=8000
+
+TELEGRAM_API_ID=38505537
+TELEGRAM_API_HASH=********
+TELEGRAM_SESSION_NAME=egx_telegram
+TELEGRAM_SOURCE_CHANNELS=
+TELEGRAM_FETCH_LIMIT_PER_CHANNEL=100
+
+TELEGRAM_BOT_TOKEN=********
+TELEGRAM_BOT_PRIVATE_CHAT_ID=
+TELEGRAM_BOT_ALLOWED_CHAT_IDS=
+TELEGRAM_ALERT_ENABLED=true
+TELEGRAM_ALERT_DECISIONS=BUY
+TELEGRAM_ALERT_MIN_CONFIDENCE=70
+TELEGRAM_ALERT_RECOMMENDATIONS_ENABLED=true
+TELEGRAM_ALERT_REQUIRE_TELEGRAM_CONFIRMATION=true
+TELEGRAM_ALERT_SCAN_INTERVAL_MINUTES=10
+
+MARKET_DATA_PROVIDER_PRIORITY=tradingview_screener,csv,mock
+ALLOW_INSECURE_MARKET_DATA_TLS=true
+SCHEDULER_ENABLED=true
+TELEGRAM_FETCH_INTERVAL_MINUTES=5
+ANALYSIS_INTERVAL_MINUTES=2
+PERFORMANCE_INTERVAL_MINUTES=60
+DAILY_REPORT_HOUR=17
+TIMEZONE=Africa/Cairo
+BOT_TOKEN=********
+API_ID=38505537
+API_HASH=********
+TELEGRAM_SESSION=egx_telegram
+SESSION_NAME=egx_telegram
+SQLITE_TIMEOUT=30
+SQLITE_BUSY_TIMEOUT=30000
+ENV=local
+PS C:\Users\omar.mokhtar\Documents\New project> Stop-Transcript
+**********************
+Windows PowerShell transcript end
+End time: 20260603194504
+**********************

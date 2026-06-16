@@ -1,0 +1,30 @@
+app = "egx-signal-analyst"
+
+[build]
+
+[env]
+  APP_ENV = "production"
+  LOG_LEVEL = "INFO"
+  API_HOST = "0.0.0.0"
+  API_PORT = "8000"
+  SCHEDULER_ENABLED = "true"
+  TELEGRAM_BOT_EMBEDDED_ENABLED = "true"
+  MARKET_DATA_PROVIDER_PRIORITY = "tradingview_screener,tradingview_websocket,csv"
+  TELEGRAM_SESSION_NAME = "/data/egx_telegram"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["app"]
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

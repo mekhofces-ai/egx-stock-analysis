@@ -1,0 +1,503 @@
+﻿from __future__ import annotations
+
+import os
+import sys
+import time
+import uuid
+import json
+import logging
+import subprocess
+import traceback
+from pathlib import Path
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+from filelock import FileLock, Timeout
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE = DATA_DIR / "automation_safe.log"
+LOCK_FILE = DATA_DIR / "automation_cycle.lock"
+STATE_FILE = DATA_DIR / "automation_state.json"
+
+sys.path.insert(0, str(PROJECT_ROOT))
+
+load_dotenv(PROJECT_ROOT / ".env")
+
+# Force safe media behavior before importing Telegram modules
+os.environ["TELEGRAM_DOWNLOAD_MEDIA"] = os.getenv("TELEGRAM_DOWNLOAD_MEDIA", "false")
+os.environ["TELEGRAM_ANALYZE_IMAGES"] = os.getenv("TELEGRAM_ANALYZE_IMAGES", "false")
+os.environ["TELEGRAM_SKIP_NON_IMAGE_MEDIA"] = os.getenv("TELEGRAM_SKIP_NON_IMAGE_MEDIA", "true")
+os.environ["TELEGRAM_FETCH_LIMIT"] = os.getenv("TELEGRAM_FETCH_LIMIT", "30")
+os.environ["TELEGRAM_FETCH_LIMIT_PER_CHANNEL"] = os.getenv("TELEGRAM_FETCH_LIMIT_PER_CHANNEL", "30")
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8")
+    ],
+)
+
+logger = logging.getLogger("safe_automation")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def env_bool(key: str, default: bool = False) -> bool:
+    value = os.getenv(key)
+
+    if value is None:
+        return default
+
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(key: str, default: int, minimum: int | None = None) -> int:
+    try:
+        value = int(str(os.getenv(key, default)).strip())
+    except Exception:
+        value = default
+
+    if minimum is not None and value < minimum:
+        value = minimum
+
+    return value
+
+
+def write_state(**kwargs):
+    state = {}
+
+    if STATE_FILE.exists():
+        try:
+            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            state = {}
+
+    state.update(kwargs)
+    state["updated_at"] = now_iso()
+
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+def get_automation_status() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    return {
+        "enabled": env_bool("AUTOMATION_ENABLED", True),
+        "interval_seconds": env_int("AUTOMATION_INTERVAL_SECONDS", 120, 60),
+        "status": "unknown",
+        "updated_at": None,
+    }
+
+
+def set_automation_enabled(enabled: bool):
+    os.environ["AUTOMATION_ENABLED"] = "true" if enabled else "false"
+    write_state(enabled=enabled, status="enabled" if enabled else "disabled")
+    return True
+
+
+def apply_telethon_media_patch():
+    """
+    Prevents Telethon from downloading PDFs, Excel, audio, and old media.
+    The automation should process text/signals, not heavy attachments.
+    """
+    try:
+        from telethon.client.downloads import DownloadMethods
+
+        if hasattr(DownloadMethods, "_egx_safe_original_download_media"):
+            return
+
+        DownloadMethods._egx_safe_original_download_media = DownloadMethods.download_media
+
+        async def safe_download_media(self, message, *args, **kwargs):
+            download_media = env_bool("TELEGRAM_DOWNLOAD_MEDIA", False)
+
+            if not download_media:
+                logger.info("Skipped Telegram media download because TELEGRAM_DOWNLOAD_MEDIA=false")
+                return None
+
+            image_exts = {
+                ".jpg", ".jpeg", ".png", ".webp", ".bmp"
+            }
+
+            try:
+                file_obj = getattr(message, "file", None)
+                ext = (getattr(file_obj, "ext", "") or "").lower()
+                name = getattr(file_obj, "name", "") or ""
+
+                if not ext and "." in name:
+                    ext = "." + name.rsplit(".", 1)[-1].lower()
+
+                if ext and ext not in image_exts:
+                    logger.info("Skipped non-image Telegram media: %s", ext)
+                    return None
+
+            except Exception:
+                pass
+
+            return await self._egx_safe_original_download_media(message, *args, **kwargs)
+
+        DownloadMethods.download_media = safe_download_media
+        logger.info("Telethon media patch applied")
+
+    except Exception as e:
+        logger.warning("Could not apply Telethon media patch: %s", e)
+
+
+def run_python_file(relative_path: str, args: list[str] | None = None, timeout: int = 180) -> bool:
+    path = PROJECT_ROOT / relative_path
+
+    if not path.exists():
+        logger.info("Skipped missing file: %s", relative_path)
+        return False
+
+    cmd = [sys.executable, "-u", str(path)]
+
+    if args:
+        cmd.extend(args)
+
+    logger.info("Running: %s", " ".join(cmd))
+
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            timeout=timeout,
+            text=True,
+            capture_output=True,
+            env=os.environ.copy(),
+        )
+
+        if result.stdout:
+            logger.info("STDOUT from %s:\n%s", relative_path, result.stdout[-4000:])
+
+        if result.stderr:
+            logger.warning("STDERR from %s:\n%s", relative_path, result.stderr[-4000:])
+
+        if result.returncode != 0:
+            logger.warning("%s returned code %s", relative_path, result.returncode)
+            return False
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        logger.warning("%s timed out after %s seconds", relative_path, timeout)
+        return False
+
+    except Exception as e:
+        logger.exception("Failed running %s: %s", relative_path, e)
+        return False
+
+
+def call_possible_function(module_name: str, function_names: list[str], timeout_label: str = "") -> bool:
+    try:
+        module = __import__(module_name, fromlist=["*"])
+
+        for fn_name in function_names:
+            fn = getattr(module, fn_name, None)
+
+            if callable(fn):
+                logger.info("Calling %s.%s()", module_name, fn_name)
+                fn()
+                return True
+
+        logger.info("No matching function found in %s: %s", module_name, function_names)
+        return False
+
+    except Exception as e:
+        logger.warning("Could not call functions from %s %s: %s", module_name, timeout_label, e)
+        logger.debug(traceback.format_exc())
+        return False
+
+
+def fetch_telegram_text_only() -> bool:
+    """
+    Fetch latest Telegram messages, with media download disabled.
+    """
+    logger.info("Task started: Telegram text fetch")
+
+    apply_telethon_media_patch()
+
+    try:
+        from app.services.ingestion import run_ingestion_cycle
+
+        result = run_ingestion_cycle()
+        logger.info("Telegram ingestion result: %s", result)
+        return True
+
+    except Exception as e:
+        logger.warning("Telegram ingestion failed: %s", e)
+        logger.debug(traceback.format_exc())
+        return False
+
+
+def run_strategy() -> bool:
+    logger.info("Task started: CLI v6 strategy")
+
+    # Prefer direct Python file.
+    # Try --all first. If script does not support it, fallback to no args.
+    ok = run_python_file(
+        "app/services/strategies/cli_v6_egx.py",
+        ["--all"],
+        timeout=240
+    )
+
+    if ok:
+        return True
+
+    ok = run_python_file(
+        "app/services/strategies/cli_v6_egx.py",
+        [],
+        timeout=240
+    )
+
+    return ok
+
+
+def run_opportunities() -> bool:
+    logger.info("Task started: Opportunity recalculation")
+
+    called = call_possible_function(
+        "app.services.opportunity_engine",
+        [
+            "run_opportunity_engine",
+            "recalculate_opportunities",
+            "update_opportunities",
+            "main",
+        ]
+    )
+
+    if called:
+        return True
+
+    ok = run_python_file(
+        "app/services/opportunity_engine.py",
+        [],
+        timeout=180
+    )
+
+    return ok
+
+
+def run_backtest_if_due(force: bool = False) -> bool:
+    interval = env_int("BACKTEST_INTERVAL_SECONDS", 3600, 600)
+
+    state = get_automation_status()
+    last_backtest_ts = state.get("last_backtest_epoch")
+
+    now = time.time()
+
+    if not force and last_backtest_ts:
+        try:
+            elapsed = now - float(last_backtest_ts)
+            if elapsed < interval:
+                logger.info("Backtest skipped. Next due in %.0f seconds", interval - elapsed)
+                return True
+        except Exception:
+            pass
+
+    logger.info("Task started: Backtest")
+
+    ok = run_python_file(
+        "app/services/backtest_cli_v6.py",
+        ["--all"],
+        timeout=600
+    )
+
+    if not ok:
+        ok = run_python_file(
+            "app/services/backtest_cli_v6.py",
+            [],
+            timeout=600
+        )
+
+    if ok:
+        write_state(last_backtest_epoch=now, last_backtest_at=now_iso())
+
+    return ok
+
+
+def send_alerts() -> int:
+    logger.info("Task started: Telegram alerts")
+
+    sent = 0
+
+    # Try bot service alert function
+    try:
+        import telegram_bot_service
+
+        fn = getattr(telegram_bot_service, "send_system_buy_alerts", None)
+
+        if callable(fn):
+            result = fn()
+            sent = int(result or 0)
+            logger.info("Alerts sent by telegram_bot_service: %s", sent)
+            return sent
+
+    except Exception as e:
+        logger.info("telegram_bot_service alerts not available: %s", e)
+
+    # Try adapter alert function
+    try:
+        from app.services import bot_analysis_adapter
+
+        for name in ["send_buy_alerts", "send_strategy_notifications"]:
+            fn = getattr(bot_analysis_adapter, name, None)
+
+            if callable(fn):
+                result = fn()
+                sent = int(result or 0)
+                logger.info("Alerts sent by bot_analysis_adapter.%s: %s", name, sent)
+                return sent
+
+    except Exception as e:
+        logger.info("adapter alerts not available: %s", e)
+
+    # Try notification service file
+    ok = run_python_file(
+        "app/services/telegram_notifications.py",
+        [],
+        timeout=120
+    )
+
+    return sent if not ok else sent
+
+
+def run_automation_cycle(force_backtest: bool = False) -> dict:
+    run_id = str(uuid.uuid4())
+    started = time.time()
+
+    write_state(
+        enabled=env_bool("AUTOMATION_ENABLED", True),
+        status="running",
+        current_run_id=run_id,
+        last_run_started_at=now_iso(),
+    )
+
+    logger.info("========== Automation cycle started: %s ==========", run_id)
+
+    result = {
+        "run_id": run_id,
+        "started_at": now_iso(),
+        "telegram_fetch": False,
+        "strategy": False,
+        "backtest": False,
+        "opportunities": False,
+        "alerts_sent": 0,
+        "status": "running",
+        "errors": [],
+    }
+
+    try:
+        result["telegram_fetch"] = fetch_telegram_text_only()
+
+        result["strategy"] = run_strategy()
+
+        result["backtest"] = run_backtest_if_due(force=force_backtest)
+
+        result["opportunities"] = run_opportunities()
+
+        result["alerts_sent"] = send_alerts()
+
+        result["status"] = "success"
+
+    except Exception as e:
+        result["status"] = "error"
+        result["errors"].append(str(e))
+        logger.exception("Automation cycle failed: %s", e)
+
+    finally:
+        duration = round(time.time() - started, 2)
+        result["duration_seconds"] = duration
+        result["finished_at"] = now_iso()
+
+        write_state(
+            status=result["status"],
+            last_run_id=run_id,
+            last_run_finished_at=result["finished_at"],
+            last_duration_seconds=duration,
+            last_alerts_sent=result["alerts_sent"],
+            last_result=result,
+        )
+
+        logger.info("========== Automation cycle finished: %s | %s sec | %s ==========", run_id, duration, result["status"])
+
+    return result
+
+
+def safe_cycle(force_backtest: bool = False) -> dict:
+    lock = FileLock(str(LOCK_FILE), timeout=2)
+
+    try:
+        with lock:
+            return run_automation_cycle(force_backtest=force_backtest)
+
+    except Timeout:
+        logger.warning("Skipped cycle: previous automation cycle is still running")
+        write_state(status="skipped_locked", last_skip_reason="previous cycle still running")
+        return {
+            "status": "skipped_locked",
+            "message": "previous cycle still running",
+        }
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="Run one cycle only")
+    parser.add_argument("--force-backtest", action="store_true", help="Run backtest in this cycle even if not due")
+
+    args = parser.parse_args()
+
+    enabled = env_bool("AUTOMATION_ENABLED", True)
+    interval = env_int("AUTOMATION_INTERVAL_SECONDS", 120, 60)
+
+    write_state(
+        enabled=enabled,
+        interval_seconds=interval,
+        status="starting",
+        started_at=now_iso(),
+    )
+
+    logger.info("Safe automation started")
+    logger.info("Enabled: %s", enabled)
+    logger.info("Interval seconds: %s", interval)
+    logger.info("Media download: %s", os.getenv("TELEGRAM_DOWNLOAD_MEDIA"))
+    logger.info("Telegram fetch limit: %s", os.getenv("TELEGRAM_FETCH_LIMIT_PER_CHANNEL"))
+
+    if args.once:
+        result = safe_cycle(force_backtest=args.force_backtest)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    while True:
+        enabled = env_bool("AUTOMATION_ENABLED", True)
+
+        if not enabled:
+            logger.info("Automation disabled. Sleeping...")
+            write_state(status="disabled")
+            time.sleep(interval)
+            continue
+
+        safe_cycle(force_backtest=False)
+        logger.info("Sleeping %s seconds before next cycle", interval)
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    main()

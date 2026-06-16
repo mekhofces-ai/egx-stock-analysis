@@ -1,0 +1,11 @@
+timestamp,source,symbol,side,level,price,quantity,num_orders
+2026-06-03 14:30:00,example,COMI,bid,1,131.70,12000,4
+2026-06-03 14:30:00,example,COMI,bid,2,131.60,18500,6
+2026-06-03 14:30:00,example,COMI,bid,3,131.50,9000,3
+2026-06-03 14:30:00,example,COMI,ask,1,131.90,8500,2
+2026-06-03 14:30:00,example,COMI,ask,2,132.00,15000,5
+2026-06-03 14:30:00,example,COMI,ask,3,132.10,10000,4
+2026-06-03 14:30:00,example,HRHO,bid,1,26.10,8000,2
+2026-06-03 14:30:00,example,HRHO,bid,2,26.00,7000,3
+2026-06-03 14:30:00,example,HRHO,ask,1,26.35,20000,7
+2026-06-03 14:30:00,example,HRHO,ask,2,26.45,12000,4

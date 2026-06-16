@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EGX Smart Screener / StockSignalPro</title>
+  </head>
+  <body>
+    <div id="root">
+      <div style="min-height:100vh;background:#0B0F14;color:#E5E7EB;font-family:Inter,Arial,sans-serif;display:grid;place-items:center;padding:24px">
+        <div style="max-width:560px;border:1px solid #243041;background:#111827;border-radius:8px;padding:20px">
+          <div style="font-size:18px;font-weight:700;color:white">EGX Smart Screener</div>
+          <div style="margin-top:8px;font-size:13px;line-height:1.6;color:#9CA3AF">Loading real market-data dashboard...</div>
+        </div>
+      </div>
+    </div>
+    <script>
+      window.addEventListener("error", function (event) {
+        var root = document.getElementById("root");
+        if (!root || root.dataset.mounted === "true") return;
+        root.innerHTML = '<div style="min-height:100vh;background:#0B0F14;color:#E5E7EB;font-family:Inter,Arial,sans-serif;display:grid;place-items:center;padding:24px"><div style="max-width:720px;border:1px solid #7f1d1d;background:#111827;border-radius:8px;padding:20px"><div style="font-size:18px;font-weight:700;color:#FCA5A5">App startup error</div><div style="margin-top:8px;font-size:13px;line-height:1.6;color:#CBD5E1">' + String(event.message || "Unknown error") + '</div></div></div>';
+      });
+      window.addEventListener("unhandledrejection", function (event) {
+        var root = document.getElementById("root");
+        if (!root || root.dataset.mounted === "true") return;
+        root.innerHTML = '<div style="min-height:100vh;background:#0B0F14;color:#E5E7EB;font-family:Inter,Arial,sans-serif;display:grid;place-items:center;padding:24px"><div style="max-width:720px;border:1px solid #7f1d1d;background:#111827;border-radius:8px;padding:20px"><div style="font-size:18px;font-weight:700;color:#FCA5A5">App startup error</div><div style="margin-top:8px;font-size:13px;line-height:1.6;color:#CBD5E1">' + String((event.reason && event.reason.message) || event.reason || "Unknown error") + '</div></div></div>';
+      });
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

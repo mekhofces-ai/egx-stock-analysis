@@ -1,0 +1,180 @@
+
+from __future__ import annotations
+# ===== EGX SUBSCRIBERS PATCH =====
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SUBSCRIBERS_DB = DATA_DIR / "telegram_subscribers.db"
+
+def _sub_conn():
+    conn = sqlite3.connect(str(SUBSCRIBERS_DB), timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    return conn
+
+def ensure_subscribers_table():
+    with _sub_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_subscribers (
+                chat_id TEXT PRIMARY KEY,
+                chat_type TEXT,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                is_active INTEGER DEFAULT 1,
+                subscribed_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        conn.commit()
+
+def register_subscriber(chat_id, chat_type=None, user=None):
+    ensure_subscribers_table()
+    user = user or {}
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with _sub_conn() as conn:
+        conn.execute("""
+            INSERT INTO telegram_subscribers
+            (chat_id, chat_type, username, first_name, last_name, is_active, subscribed_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                chat_type=excluded.chat_type,
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                is_active=1,
+                updated_at=excluded.updated_at
+        """, (
+            str(chat_id),
+            str(chat_type or ""),
+            str(user.get("username") or ""),
+            str(user.get("first_name") or ""),
+            str(user.get("last_name") or ""),
+            now,
+            now
+        ))
+        conn.commit()
+
+def unregister_subscriber(chat_id):
+    ensure_subscribers_table()
+    with _sub_conn() as conn:
+        conn.execute(
+            "UPDATE telegram_subscribers SET is_active=0, updated_at=? WHERE chat_id=?",
+            (datetime.now().isoformat(timespec="seconds"), str(chat_id))
+        )
+        conn.commit()
+
+def get_subscribers():
+    ensure_subscribers_table()
+    with _sub_conn() as conn:
+        rows = conn.execute("""
+            SELECT chat_id, chat_type, username, first_name
+            FROM telegram_subscribers
+            WHERE is_active=1
+            ORDER BY updated_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+def get_alert_chat_ids():
+    ids = []
+
+    # Keep private admin chat too
+    for value in [
+        os.getenv("TELEGRAM_BOT_PRIVATE_CHAT_ID"),
+        os.getenv("TELEGRAM_PRIVATE_CHAT_ID"),
+        os.getenv("PRIVATE_CHAT_ID")
+    ]:
+        if value and str(value).strip():
+            ids.append(str(value).strip())
+
+    # Add comma-separated allowed chat IDs from .env
+    allowed = os.getenv("TELEGRAM_BOT_ALLOWED_CHAT_IDS", "")
+    for part in allowed.split(","):
+        part = part.strip()
+        if part:
+            ids.append(part)
+
+    # Add subscribers
+    try:
+        for sub in get_subscribers():
+            ids.append(str(sub["chat_id"]))
+    except Exception as e:
+        print("Could not load subscribers:", e)
+
+    # Unique while preserving order
+    unique = []
+    seen = set()
+    for x in ids:
+        if x not in seen:
+            unique.append(x)
+            seen.add(x)
+
+    return unique
+
+def broadcast_message(text):
+    chat_ids = get_alert_chat_ids()
+    sent = 0
+
+    for cid in chat_ids:
+        try:
+            send_message(cid, text)
+            sent += 1
+        except Exception as e:
+            print("Broadcast failed to", cid, e)
+
+    return sent
+# ===== END EGX SUBSCRIBERS PATCH =====
+
+
+from pathlib import Path
+
+import logging
+import ssl
+
+import httpx
+
+from app.config import get_settings
+from app.database import init_db
+from app.services.telegram_bot import create_bot_application
+
+
+def _is_ssl_error(exc: Exception) -> bool:
+    if isinstance(exc, ssl.SSLError):
+        return True
+    text = str(exc).lower()
+    return "certificate_verify_failed" in text or "self-signed certificate" in text or "certificate verify failed" in text
+
+
+def _settings_after_tls_preflight(settings):
+    if not settings.telegram_bot_token or not settings.telegram_bot_verify_tls:
+        return settings
+    try:
+        with httpx.Client(timeout=10.0, verify=True) as client:
+            response = client.get(f"https://api.telegram.org/bot{settings.telegram_bot_token}/getMe")
+        response.raise_for_status()
+        return settings
+    except Exception as exc:
+        if _is_ssl_error(exc):
+            logging.getLogger(__name__).warning("Telegram bot TLS verification failed; retrying with verify=False.")
+            return settings.model_copy(update={"telegram_bot_verify_tls": False})
+        logging.getLogger(__name__).warning("Telegram bot preflight failed; polling will retry normally.")
+        return settings
+
+
+def main() -> None:
+    settings = _settings_after_tls_preflight(get_settings())
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    init_db(seed=True)
+    bot_application = create_bot_application(settings)
+    if bot_application is None:
+        raise SystemExit("TELEGRAM_BOT_TOKEN is not configured or python-telegram-bot is not installed.")
+    logging.getLogger(__name__).info("Telegram bot service starting.")
+    bot_application.run_polling()
+
+
+if __name__ == "__main__":
+    main()

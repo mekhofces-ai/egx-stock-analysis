@@ -1,0 +1,102 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model EgxSymbol {
+  symbolCode        String   @id @map("symbol_code")
+  tradingviewSymbol String   @map("tradingview_symbol")
+  companyNameEn     String   @map("company_name_en")
+  companyNameAr     String?  @map("company_name_ar")
+  sector            String?
+  industry          String?
+  isActive          Boolean  @default(true) @map("is_active")
+  isPlaceholder     Boolean  @default(false) @map("is_placeholder")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  candles   Candle[]
+  quotes    QuoteSnapshot[]
+  watchlist WatchlistItem?
+
+  @@map("egx_symbols")
+}
+
+model Candle {
+  id          String   @id @default(cuid())
+  symbolCode  String   @map("symbol_code")
+  timeframe   String
+  candleTime  DateTime @map("candle_time")
+  open        Float
+  high        Float
+  low         Float
+  close       Float
+  volume      Float
+  source      String
+  quality     String   @default("real")
+  rawPayload   Json?    @map("raw_payload")
+  importedAt  DateTime @default(now()) @map("imported_at")
+  symbol      EgxSymbol @relation(fields: [symbolCode], references: [symbolCode])
+
+  @@unique([symbolCode, timeframe, candleTime])
+  @@index([symbolCode, timeframe, candleTime])
+  @@map("candles")
+}
+
+model QuoteSnapshot {
+  id             String   @id @default(cuid())
+  symbolCode     String   @map("symbol_code")
+  price          Float
+  previousClose  Float?   @map("previous_close")
+  changePercent  Float?   @map("change_percent")
+  volume         Float?
+  marketCap      Float?   @map("market_cap")
+  bid            Float?
+  ask            Float?
+  orderBookStatus String  @default("unavailable") @map("order_book_status")
+  orderBookNote  String?  @map("order_book_note")
+  source         String
+  rawPayload     Json?    @map("raw_payload")
+  capturedAt     DateTime @default(now()) @map("captured_at")
+  symbol         EgxSymbol @relation(fields: [symbolCode], references: [symbolCode])
+
+  @@index([symbolCode, capturedAt])
+  @@map("quote_snapshots")
+}
+
+model RawDataSnapshot {
+  id         String   @id @default(cuid())
+  provider   String
+  endpoint   String
+  symbolCode String?  @map("symbol_code")
+  status     String
+  payload    Json?
+  error      String?
+  capturedAt DateTime @default(now()) @map("captured_at")
+
+  @@index([provider, capturedAt])
+  @@map("raw_data_snapshots")
+}
+
+model WatchlistItem {
+  symbolCode String   @id @map("symbol_code")
+  notes      String?
+  alertEnabled Boolean @default(true) @map("alert_enabled")
+  createdAt  DateTime @default(now()) @map("created_at")
+  symbol     EgxSymbol @relation(fields: [symbolCode], references: [symbolCode])
+
+  @@map("watchlist")
+}
+
+model ProviderStatus {
+  provider  String   @id
+  status    String
+  reason    String?
+  checkedAt DateTime @default(now()) @map("checked_at")
+
+  @@map("provider_status")
+}

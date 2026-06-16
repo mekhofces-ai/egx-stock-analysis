@@ -1,0 +1,11 @@
+symbol,name_ar,name_en,sector,tradingview_symbol,is_active
+COMI,البنك التجاري الدولي,Commercial International Bank,Banks,EGX:COMI,true
+HRHO,اي اف جي القابضة,EFG Holding,Financial Services,EGX:HRHO,true
+TMGH,طلعت مصطفى القابضة,Talaat Moustafa Group,Real Estate,EGX:TMGH,true
+ORAS,اوراسكوم كونستراكشون,Orascom Construction,Construction,EGX:ORAS,true
+FWRY,فوري,Fawry,Technology,EGX:FWRY,true
+ABUK,ابوقير للاسمدة,Abou Kir Fertilizers,Fertilizers,EGX:ABUK,true
+ESRS,حديد عز,Ezz Steel,Basic Materials,EGX:ESRS,true
+SWDY,السويدي اليكتريك,Elsewedy Electric,Industrials,EGX:SWDY,true
+ETEL,المصرية للاتصالات,Telecom Egypt,Telecom,EGX:ETEL,true
+EFIH,اي فاينانس,e-finance,Technology,EGX:EFIH,true

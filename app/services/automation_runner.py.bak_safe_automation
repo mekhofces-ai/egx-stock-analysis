@@ -1,0 +1,349 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Callable
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.config import RISK_NOTE, Settings, get_settings
+from app.database import SessionLocal, init_db, sqlite_write_lock
+from app.models import AutomationRun, AutomationState
+from app.services.backtest_cli_v6 import BACKTEST_TIMEFRAMES, run_cli_v6_backtest_universe
+from app.services.ingestion import run_ingestion_cycle
+from app.services.opportunity_engine import refresh_opportunities, send_buy_alerts, send_strategy_notifications
+from app.services.performance_tracker import update_channel_performance
+from app.services.strategies.cli_v6_egx import run_cli_v6_universe
+from app.services.tradingview_screener import run_tradingview_screening
+
+
+logger = logging.getLogger(__name__)
+LOCK_PATH = ROOT / "data" / "automation_runner.lock"
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@contextmanager
+def automation_lock(stale_seconds: int = 600):
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd: int | None = None
+    try:
+        try:
+            if LOCK_PATH.exists() and time.time() - LOCK_PATH.stat().st_mtime > stale_seconds:
+                LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    except FileExistsError as exc:
+        raise RuntimeError("Automation cycle is already running; skipping overlap.") from exc
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove automation lock file.")
+
+
+def _state_get(db: Session, key: str) -> str | None:
+    state = db.scalar(select(AutomationState).where(AutomationState.key == key))
+    return state.value if state else None
+
+
+def _state_set(db: Session, key: str, value: str | None) -> None:
+    state = db.scalar(select(AutomationState).where(AutomationState.key == key))
+    if state:
+        state.value = value
+        state.updated_at = utcnow()
+    else:
+        db.add(AutomationState(key=key, value=value, updated_at=utcnow()))
+
+
+def set_automation_enabled(enabled: bool, db: Session | None = None) -> dict[str, Any]:
+    def _run(active_db: Session) -> dict[str, Any]:
+        with sqlite_write_lock():
+            _state_set(active_db, "enabled", "true" if enabled else "false")
+            active_db.commit()
+        return {"enabled": enabled, "risk_note": RISK_NOTE}
+
+    if db is not None:
+        return _run(db)
+    with SessionLocal() as active_db:
+        return _run(active_db)
+
+
+def _automation_enabled(db: Session, settings: Settings) -> bool:
+    value = _state_get(db, "enabled")
+    if value is None:
+        return bool(settings.automation_enabled)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_automation_status(db: Session | None = None, settings: Settings | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+
+    def _run(active_db: Session) -> dict[str, Any]:
+        latest = active_db.scalar(select(AutomationRun).order_by(AutomationRun.started_at.desc(), AutomationRun.id.desc()))
+        running = LOCK_PATH.exists() or str(_state_get(active_db, "running") or "").lower() == "true"
+        next_run_at = _state_get(active_db, "next_run_at")
+        return {
+            "enabled": _automation_enabled(active_db, settings),
+            "running": running,
+            "interval_seconds": settings.safe_automation_interval_seconds,
+            "last_run_time": latest.started_at.isoformat() if latest else None,
+            "last_finished_at": latest.finished_at.isoformat() if latest and latest.finished_at else None,
+            "last_status": latest.status if latest else None,
+            "next_run_time": next_run_at,
+            "last_error": latest.error_message if latest else None,
+            "last_alert_count": latest.alerts_sent if latest else 0,
+            "symbols_processed": latest.symbols_processed if latest else 0,
+            "opportunities_count": latest.opportunities_count if latest else 0,
+            "private_chat_configured": settings.telegram_bot_private_chat_id is not None,
+            "risk_note": RISK_NOTE,
+        }
+
+    if db is not None:
+        return _run(db)
+    with SessionLocal() as active_db:
+        return _run(active_db)
+
+
+def _run_task(name: str, func: Callable[[], Any], soft_timeout_seconds: int) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        output = func()
+        duration = round(time.monotonic() - started, 2)
+        status = "success" if duration <= soft_timeout_seconds else "slow"
+        return {"name": name, "status": status, "duration_seconds": duration, "output": output}
+    except Exception as exc:
+        logger.exception("Automation task failed: %s", name)
+        return {"name": name, "status": "failed", "duration_seconds": round(time.monotonic() - started, 2), "error": str(exc)}
+
+
+def run_automation_cycle(
+    settings: Settings | None = None,
+    send_alerts_enabled: bool = True,
+    run_backtests_enabled: bool = True,
+) -> dict[str, Any]:
+    settings = settings or get_settings()
+    run_id = f"automation_{utcnow():%Y%m%d%H%M%S}_{uuid.uuid4().hex[:8]}"
+    started_at = utcnow()
+    init_db(seed=True)
+    with automation_lock(stale_seconds=max(settings.safe_automation_interval_seconds * 4, 300)):
+        with SessionLocal() as db:
+            if not _automation_enabled(db, settings):
+                return {"run_id": run_id, "status": "disabled", "tasks": [], "risk_note": RISK_NOTE}
+            with sqlite_write_lock():
+                db.add(AutomationRun(run_id=run_id, started_at=started_at, status="running"))
+                _state_set(db, "running", "true")
+                _state_set(db, "last_run_id", run_id)
+                _state_set(db, "last_started_at", started_at.isoformat())
+                db.commit()
+
+        tasks: list[dict[str, Any]] = []
+        soft_timeout = max(45, min(settings.safe_automation_interval_seconds, 180))
+
+        if send_alerts_enabled:
+            tasks.append(_run_task("fetch_telegram_and_analyze", lambda: run_ingestion_cycle().to_dict(), soft_timeout))
+        else:
+            tasks.append(
+                {
+                    "name": "fetch_telegram_and_analyze",
+                    "status": "skipped",
+                    "duration_seconds": 0.0,
+                    "output": {"reason": "disabled for no-alerts smoke run"},
+                }
+            )
+
+        def _screening_task() -> dict[str, Any]:
+            with SessionLocal() as db:
+                return run_tradingview_screening(db, settings=settings, limit=500)
+
+        tasks.append(_run_task("tradingview_screening", _screening_task, soft_timeout))
+
+        def _strategy_task() -> dict[str, Any]:
+            with SessionLocal() as db:
+                limit = settings.automation_symbol_limit if settings.automation_symbol_limit > 0 else None
+                return run_cli_v6_universe(db, settings=settings, limit=limit)
+
+        strategy_task = _run_task("cli_v6_strategy", _strategy_task, soft_timeout)
+        tasks.append(strategy_task)
+        strategy_output = strategy_task.get("output") if isinstance(strategy_task.get("output"), dict) else {}
+        strategy_rows = strategy_output.get("rows") if isinstance(strategy_output, dict) else []
+        symbols_for_backtest = [row.get("symbol") for row in strategy_rows if row.get("symbol")][: settings.strategy_symbol_limit]
+
+        if run_backtests_enabled:
+            def _backtest_task() -> dict[str, Any]:
+                with SessionLocal() as db:
+                    return run_cli_v6_backtest_universe(
+                        db,
+                        settings=settings,
+                        symbols=symbols_for_backtest or None,
+                        timeframes=BACKTEST_TIMEFRAMES,
+                        limit=settings.strategy_symbol_limit,
+                    )
+
+            tasks.append(_run_task("cli_v6_backtest", _backtest_task, soft_timeout * 3))
+        else:
+            tasks.append(
+                {
+                    "name": "cli_v6_backtest",
+                    "status": "skipped",
+                    "duration_seconds": 0.0,
+                    "output": {"reason": "disabled for this run"},
+                }
+            )
+
+        def _opportunity_task() -> dict[str, Any]:
+            with SessionLocal() as db:
+                opportunity_limit = settings.automation_symbol_limit if settings.automation_symbol_limit > 0 else 500
+                return refresh_opportunities(db, settings=settings, limit=opportunity_limit, run_screening=False)
+
+        opportunity_task = _run_task("refresh_opportunities", _opportunity_task, soft_timeout)
+        tasks.append(opportunity_task)
+
+        if send_alerts_enabled:
+            def _alert_task() -> dict[str, Any]:
+                with SessionLocal() as db:
+                    strategy_alerts = send_strategy_notifications(db, settings=settings)
+                    opportunity_alerts = send_buy_alerts(db, settings=settings)
+                    return {"strategy_alerts": strategy_alerts, "opportunity_alerts": opportunity_alerts}
+
+            alert_task = _run_task("send_telegram_notifications", _alert_task, soft_timeout)
+        else:
+            alert_task = {"name": "send_telegram_notifications", "status": "skipped", "duration_seconds": 0.0, "output": {"reason": "disabled for this run"}}
+        tasks.append(alert_task)
+
+        def _performance_task() -> dict[str, Any]:
+            with SessionLocal() as db:
+                performances = update_channel_performance(db)
+                return {"channels": len(performances)}
+
+        tasks.append(_run_task("channel_performance", _performance_task, soft_timeout))
+
+        finished_at = utcnow()
+        failed = [task for task in tasks if task.get("status") == "failed"]
+        status = "success" if not failed else "partial_success"
+        opportunity_output = opportunity_task.get("output") if isinstance(opportunity_task.get("output"), dict) else {}
+        alert_output = alert_task.get("output") if isinstance(alert_task.get("output"), dict) else {}
+        alerts_sent = 0
+        for item in [alert_output.get("strategy_alerts"), alert_output.get("opportunity_alerts")]:
+            if isinstance(item, dict):
+                alerts_sent += int(item.get("sent") or 0)
+        symbols_processed = len(strategy_rows) if isinstance(strategy_rows, list) else 0
+        opportunities_count = int(opportunity_output.get("saved") or 0) if isinstance(opportunity_output, dict) else 0
+        error_message = "; ".join(str(task.get("error")) for task in failed if task.get("error"))[:4000] if failed else None
+        duration = round((finished_at - started_at).total_seconds(), 2)
+        next_run = finished_at + timedelta(seconds=settings.safe_automation_interval_seconds)
+        with SessionLocal() as db:
+            with sqlite_write_lock():
+                run = db.scalar(select(AutomationRun).where(AutomationRun.run_id == run_id))
+                if run:
+                    run.finished_at = finished_at
+                    run.status = status
+                    run.duration_seconds = duration
+                    run.symbols_processed = symbols_processed
+                    run.opportunities_count = opportunities_count
+                    run.alerts_sent = alerts_sent
+                    run.error_message = error_message
+                _state_set(db, "running", "false")
+                _state_set(db, "last_finished_at", finished_at.isoformat())
+                _state_set(db, "next_run_at", next_run.isoformat())
+                _state_set(db, "last_alert_count", str(alerts_sent))
+                if error_message:
+                    _state_set(db, "last_error", error_message)
+                db.commit()
+        return {
+            "run_id": run_id,
+            "status": status,
+            "duration_seconds": duration,
+            "symbols_processed": symbols_processed,
+            "opportunities_count": opportunities_count,
+            "alerts_sent": alerts_sent,
+            "tasks": tasks,
+            "risk_note": RISK_NOTE,
+        }
+
+
+def run_forever(settings: Settings | None = None) -> None:
+    settings = settings or get_settings()
+    logger.info("Automation runner started. Interval=%s seconds.", settings.safe_automation_interval_seconds)
+    while True:
+        start = time.monotonic()
+        try:
+            result = run_automation_cycle(settings=settings)
+            logger.info(
+                "Automation cycle %s finished with status=%s symbols=%s alerts=%s.",
+                result.get("run_id"),
+                result.get("status"),
+                result.get("symbols_processed"),
+                result.get("alerts_sent"),
+            )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            logger.exception("Automation cycle crashed but runner will continue: %s", exc)
+            with SessionLocal() as db:
+                with sqlite_write_lock():
+                    _state_set(db, "running", "false")
+                    _state_set(db, "last_error", str(exc))
+                    db.commit()
+        elapsed = time.monotonic() - start
+        sleep_for = max(1.0, settings.safe_automation_interval_seconds - elapsed)
+        with SessionLocal() as db:
+            with sqlite_write_lock():
+                _state_set(db, "next_run_at", (utcnow() + timedelta(seconds=sleep_for)).isoformat())
+                db.commit()
+        time.sleep(sleep_for)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run EGX automation every 1 or 2 minutes.")
+    parser.add_argument("--once", action="store_true", help="Run one cycle then exit.")
+    parser.add_argument("--no-alerts", action="store_true", help="Skip Telegram notification sends for this run.")
+    parser.add_argument("--skip-backtests", action="store_true", help="Skip backtest refresh for this run.")
+    parser.add_argument("--enable", action="store_true", help="Enable automation state and exit.")
+    parser.add_argument("--disable", action="store_true", help="Disable automation state and exit.")
+    args = parser.parse_args()
+    settings = get_settings()
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    init_db(seed=True)
+    if args.enable:
+        print(set_automation_enabled(True))
+        return
+    if args.disable:
+        print(set_automation_enabled(False))
+        return
+    if args.once:
+        result = run_automation_cycle(
+            settings=settings,
+            send_alerts_enabled=not args.no_alerts,
+            run_backtests_enabled=not args.skip_backtests,
+        )
+        print(json.dumps(result, ensure_ascii=True, indent=2, default=str))
+        return
+    run_forever(settings=settings)
+
+
+if __name__ == "__main__":
+    main()

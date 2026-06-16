@@ -1,0 +1,28 @@
+services:
+  api:
+    build: .
+    command: python -m app.main
+    env_file:
+      - .env
+    environment:
+      EGX_DATABASE_URL: sqlite:////app/data/egx_signals.db
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+
+  dashboard:
+    build: .
+    command: streamlit run dashboard/streamlit_app.py --server.address=0.0.0.0 --server.port=8509
+    env_file:
+      - .env
+    environment:
+      EGX_DATABASE_URL: sqlite:////app/data/egx_signals.db
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8509:8509"
+    depends_on:
+      - api

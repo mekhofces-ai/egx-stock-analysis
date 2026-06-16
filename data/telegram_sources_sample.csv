@@ -1,0 +1,3 @@
+username,title,source_type,is_active,trust_score,notes
+@egyptianborsa,Egyptian Borsa,channel,true,50,Seed example source
+https://t.me/example_channel,Example Channel,channel,true,50,Links are accepted too
