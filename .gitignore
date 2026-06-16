@@ -32,3 +32,9 @@ backups/
 node_modules/
 dist/
 .npm-cache/
+tools/cloudflared.exe
+*.png
+*.jpg
+*.jpeg
+*.gif
+.codex-screenshots/
